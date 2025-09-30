@@ -10,7 +10,7 @@ export interface Config {
 
 export const Config: Schema<Config> = Schema.object({
   apiKey: Schema.string().required().description('API密钥'),
-  cooldownTime: Schema.number().default(5000).min(1000).max(60000).description('等待发送图片的时间(毫秒)'),
+  cooldownTime: Schema.number().default(30).min(5).max(300).description('等待发送图片的时间(秒)'),
   enableLog: Schema.boolean().default(true).description('启用日志记录')
 })
 
@@ -93,10 +93,119 @@ export function apply(ctx: Context, config: Config) {
   // 上传图片到临时服务器
   async function uploadImageToTempServer(imageUrl: string): Promise<string> {
     try {
-      // 如果是网络URL，直接返回
+      // 如果是网络URL，检查是否为腾讯多媒体链接
       if (imageUrl.startsWith('http://') || imageUrl.startsWith('https://')) {
-        logInfo('手办化模块: 使用网络URL', { url: imageUrl.substring(0, 100) + '...' })
-        return imageUrl
+        // 检查是否为腾讯多媒体下载链接
+        if (imageUrl.includes('multimedia.nt.qq.com.cn')) {
+          logInfo('手办化模块: 检测到腾讯多媒体链接，尝试下载并转换为base64', { url: imageUrl.substring(0, 100) + '...' })
+          
+          try {
+            // 下载图片并转换为base64
+            const response = await ctx.http.get(imageUrl, { 
+              responseType: 'arraybuffer',
+              timeout: 15000,
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Referer': 'https://im.qq.com/',
+                'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8'
+              }
+            }) as ArrayBuffer
+            
+            const buffer = Buffer.from(response)
+            const base64 = buffer.toString('base64')
+            
+            // 根据文件扩展名确定MIME类型
+            let contentType = 'image/jpeg'
+            if (imageUrl.includes('.png')) {
+              contentType = 'image/png'
+            } else if (imageUrl.includes('.gif')) {
+              contentType = 'image/gif'
+            } else if (imageUrl.includes('.webp')) {
+              contentType = 'image/webp'
+            }
+            
+            const dataUrl = `data:${contentType};base64,${base64}`
+            
+            logInfo('手办化模块: 腾讯多媒体链接转换成功', {
+              originalUrl: imageUrl.substring(0, 100) + '...',
+              size: buffer.length,
+              contentType,
+              dataUrlLength: dataUrl.length
+            })
+            
+            return dataUrl
+          } catch (downloadError) {
+            logError('手办化模块: 腾讯多媒体链接下载失败，尝试直接使用原链接', {
+              url: imageUrl.substring(0, 100) + '...',
+              error: downloadError?.message
+            })
+            // 下载失败时，仍然尝试使用原链接
+            return imageUrl
+          }
+        } else {
+          // 检查是否为其他可能需要特殊处理的链接
+          const problematicDomains = [
+            'multimedia.nt.qq.com.cn',
+            'c2cpicdw.qpic.cn',
+            'gchat.qpic.cn',
+            'wx.qlogo.cn'
+          ]
+          
+          const isProblematic = problematicDomains.some(domain => imageUrl.includes(domain))
+          
+          if (isProblematic) {
+            logInfo('手办化模块: 检测到可能的问题链接，尝试下载并转换为base64', { 
+              url: imageUrl.substring(0, 100) + '...',
+              domain: problematicDomains.find(domain => imageUrl.includes(domain))
+            })
+            
+            try {
+              // 下载图片并转换为base64
+              const response = await ctx.http.get(imageUrl, { 
+                responseType: 'arraybuffer',
+                timeout: 15000,
+                headers: {
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                  'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8'
+                }
+              }) as ArrayBuffer
+              
+              const buffer = Buffer.from(response)
+              const base64 = buffer.toString('base64')
+              
+              // 根据文件扩展名确定MIME类型
+              let contentType = 'image/jpeg'
+              if (imageUrl.includes('.png')) {
+                contentType = 'image/png'
+              } else if (imageUrl.includes('.gif')) {
+                contentType = 'image/gif'
+              } else if (imageUrl.includes('.webp')) {
+                contentType = 'image/webp'
+              }
+              
+              const dataUrl = `data:${contentType};base64,${base64}`
+              
+              logInfo('手办化模块: 问题链接转换成功', {
+                originalUrl: imageUrl.substring(0, 100) + '...',
+                size: buffer.length,
+                contentType,
+                dataUrlLength: dataUrl.length
+              })
+              
+              return dataUrl
+            } catch (downloadError) {
+              logError('手办化模块: 问题链接下载失败，尝试直接使用原链接', {
+                url: imageUrl.substring(0, 100) + '...',
+                error: downloadError?.message
+              })
+              // 下载失败时，仍然尝试使用原链接
+              return imageUrl
+            }
+          } else {
+            logInfo('手办化模块: 使用普通网络URL', { url: imageUrl.substring(0, 100) + '...' })
+            return imageUrl
+          }
+        }
       }
       
       // 如果是base64，直接返回
@@ -147,68 +256,111 @@ export function apply(ctx: Context, config: Config) {
   async function waitForImage(session: any, style: number): Promise<string> {
     const userId = session.userId
     
-    // 标记用户为处理中状态
-    processingUsers.add(userId)
-    
     // 清除之前的等待状态
     if (waitingImages.has(userId)) {
       const { timeout } = waitingImages.get(userId)!
       clearTimeout(timeout)
     }
     
-    // 设置10秒超时
+    // 设置超时时间
+    const timeoutMs = config.cooldownTime * 1000
     const timeout = setTimeout(() => {
       waitingImages.delete(userId)
       processingUsers.delete(userId)
       session.send('等待超时，请重新发送指令')
-    }, 10000)
+    }, timeoutMs)
     
     waitingImages.set(userId, { style, timeout })
     
-    return `请发送一张图片，我将使用风格${style}进行手办化处理（10秒内有效）`
+    return `[${userId}] 请发送一张图片，我将使用风格${style}进行手办化处理（${config.cooldownTime}秒内有效）`
   }
 
   // 处理图片
   async function processImage(session: any, imageUrl: string, style: number): Promise<void> {
     const userId = session.userId
+    let processedUrl: string | undefined
     
     try {
-      // 标记用户为处理中状态
-      processingUsers.add(userId)
-      
-      logInfo(`手办化模块: 开始处理图片，风格${style}`, { imageUrl: imageUrl.substring(0, 100) + '...' })
+      logInfo(`手办化模块: 开始处理图片，风格${style}`, { imageUrl: imageUrl.substring(0, 100) + '...', userId })
       
       // 发送处理中消息
       await session.send('正在生成手办化图片，请稍候...')
       
       // 处理图片URL
-      const processedUrl = await uploadImageToTempServer(imageUrl)
+      processedUrl = await uploadImageToTempServer(imageUrl)
       logInfo('手办化模块: 图片URL处理完成', { 
         original: imageUrl.substring(0, 50) + '...',
         processed: processedUrl.substring(0, 50) + '...'
       })
       
       // 调用API
-      const response = await ctx.http.get('https://v2.xxapi.cn/api/generateFigurineImage', {
-        params: {
-          style: style,
-          url: processedUrl,
-          key: config.apiKey
-        },
-        timeout: 30000
-      }) as FigurineResponse
+      logInfo('手办化模块: 发送API请求', {
+        style: style,
+        url: processedUrl.substring(0, 100) + '...',
+        keyLength: config.apiKey?.length || 0,
+        urlType: processedUrl.startsWith('data:') ? 'base64' : 'http'
+      })
       
-      logInfo('手办化模块: API响应', { code: response.code })
+      let response: FigurineResponse
+      
+      // 如果是base64数据，使用POST请求避免URL过长
+      if (processedUrl.startsWith('data:image/')) {
+        const base64Data = processedUrl.split(',')[1] // 移除data:image/jpeg;base64,前缀
+        
+        response = await ctx.http.post('https://v2.xxapi.cn/api/generateFigurineImage', {
+          style: style,
+          image: base64Data,
+          key: config.apiKey
+        }, {
+          timeout: 30000,
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        }) as FigurineResponse
+      } else {
+        // 普通URL使用GET请求
+        response = await ctx.http.get('https://v2.xxapi.cn/api/generateFigurineImage', {
+          params: {
+            style: style,
+            url: processedUrl,
+            key: config.apiKey
+          },
+          timeout: 30000
+        }) as FigurineResponse
+      }
+      
+      logInfo('手办化模块: API响应', { 
+        code: response.code, 
+        msg: response.msg,
+        hasData: !!response.data,
+        requestId: response.request_id,
+        fullResponse: response
+      })
       
       if (response.code !== 200) {
-        logError('手办化模块: API返回错误', { code: response.code, msg: response.msg })
+        logError('手办化模块: API返回错误', { 
+          code: response.code, 
+          msg: response.msg,
+          requestId: response.request_id,
+          fullResponse: response,
+          requestType: processedUrl.startsWith('data:') ? 'POST' : 'GET',
+          requestParams: {
+            style: style,
+            url: processedUrl.substring(0, 100) + '...',
+            keyLength: config.apiKey?.length || 0
+          }
+        })
         await session.send(`手办化失败: ${response.msg || '未知错误'}`)
+        // 处理失败时立即清除处理状态
+        processingUsers.delete(userId)
         return
       }
       
       if (!response.data) {
         logError('手办化模块: API返回数据为空')
         await session.send('手办化失败: 未获取到生成图片')
+        // 处理失败时立即清除处理状态
+        processingUsers.delete(userId)
         return
       }
       
@@ -219,17 +371,27 @@ export function apply(ctx: Context, config: Config) {
       logInfo('手办化模块: 成功发送手办化图片', { 
         style, 
         originalUrl: imageUrl.substring(0, 50) + '...',
-        resultUrl: response.data.substring(0, 50) + '...'
+        resultUrl: response.data.substring(0, 50) + '...',
+        requestId: response.request_id,
+        resultDataLength: response.data?.length || 0
       })
       
       // 等待配置的时间后清除处理状态
       setTimeout(() => {
         processingUsers.delete(userId)
         logInfo('手办化模块: 用户处理状态已清除', { userId })
-      }, config.cooldownTime)
+      }, config.cooldownTime * 1000)
       
     } catch (error) {
-      logError('手办化模块: 处理图片失败', error)
+      logError('手办化模块: 处理图片失败', {
+        error: error,
+        errorMessage: error?.message || '未知错误',
+        errorStack: error?.stack,
+        userId: userId,
+        style: style,
+        imageUrl: imageUrl.substring(0, 100) + '...',
+        processedUrl: processedUrl?.substring(0, 100) + '...' || '未处理'
+      })
       await session.send('手办化处理失败，请检查图片链接是否有效或稍后重试')
       // 处理失败时立即清除处理状态
       processingUsers.delete(userId)
@@ -240,15 +402,18 @@ export function apply(ctx: Context, config: Config) {
   for (let style = 1; style <= 4; style++) {
     ctx.command(`手办化${style}`, `使用风格${style}进行手办化`)
       .action(async (argv) => {
+        const userId = argv.session.userId
+        
+        // 检查用户是否正在处理中
+        if (processingUsers.has(userId)) {
+          return '手办化正在处理中，请等待当前任务完成后再试'
+        }
+        
+        // 立即标记用户为处理中状态，防止重复调用
+        processingUsers.add(userId)
+        
         try {
-          const userId = argv.session.userId
-          
-          // 检查用户是否正在处理中
-          if (processingUsers.has(userId)) {
-            return '手办化正在处理中，请等待当前任务完成后再试'
-          }
-          
-          logInfo(`手办化模块: 用户请求手办化风格${style}`)
+          logInfo(`手办化模块: 用户请求手办化风格${style}`, { userId })
           
           // 检查消息中是否有图片
           const images = extractImages(argv.session)
@@ -261,10 +426,33 @@ export function apply(ctx: Context, config: Config) {
           }
         } catch (error) {
           logError('手办化模块错误', error)
+          // 处理失败时也要清除处理状态
+          processingUsers.delete(userId)
           return '手办化处理失败，请稍后重试'
         }
       })
   }
+
+  // 添加重置处理状态的指令
+  ctx.command('手办化重置', '重置手办化处理状态')
+    .action(async (argv) => {
+      const userId = argv.session.userId
+      const wasProcessing = processingUsers.has(userId)
+      
+      // 清除处理状态
+      processingUsers.delete(userId)
+      
+      // 清除等待状态
+      if (waitingImages.has(userId)) {
+        const { timeout } = waitingImages.get(userId)!
+        clearTimeout(timeout)
+        waitingImages.delete(userId)
+      }
+      
+      logInfo('手办化模块: 手动重置用户状态', { userId, wasProcessing })
+      
+      return wasProcessing ? '已重置处理状态，可以重新使用手办化指令' : '当前没有处理中的任务'
+    })
 
   // 监听消息事件，处理等待中的图片
   ctx.on('message', async (session) => {
