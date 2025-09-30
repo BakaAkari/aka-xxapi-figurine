@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-aka-xxapi-figurine",
   "description": "使用xxapi提供的手办化插件",
-  "version": "0.0.6",
+  "version": "0.0.8",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [

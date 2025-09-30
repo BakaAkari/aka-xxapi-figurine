@@ -5,12 +5,16 @@ export const name = 'aka-xxapi-figurine'
 export interface Config {
   apiKey: string
   cooldownTime: number
+  apiTimeout: number
+  maxImageSize: number
   enableLog: boolean
 }
 
 export const Config: Schema<Config> = Schema.object({
   apiKey: Schema.string().required().description('API密钥'),
   cooldownTime: Schema.number().default(30).min(5).max(300).description('等待发送图片的时间(秒)'),
+  apiTimeout: Schema.number().default(120).min(30).max(300).description('API请求超时时间(秒)'),
+  maxImageSize: Schema.number().default(10).min(1).max(50).description('最大图片大小限制(MB)'),
   enableLog: Schema.boolean().default(true).description('启用日志记录')
 })
 
@@ -96,48 +100,75 @@ export function apply(ctx: Context, config: Config) {
     return images
   }
 
+  // 检测图片大小
+  async function checkImageSize(imageUrl: string): Promise<{ size: number, isValid: boolean }> {
+    try {
+      // 发送HEAD请求获取图片大小
+      const response = await ctx.http.head(imageUrl, {
+        timeout: 10000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+      })
+      
+      const contentLength = parseInt((response as any).headers?.['content-length'] || '0')
+      const sizeInMB = contentLength / (1024 * 1024)
+      const isValid = sizeInMB <= config.maxImageSize
+      
+      logInfo('手办化模块: 图片大小检测', {
+        url: imageUrl.substring(0, 100) + '...',
+        sizeInMB: sizeInMB.toFixed(2),
+        maxSize: config.maxImageSize,
+        isValid: isValid
+      })
+      
+      return { size: sizeInMB, isValid }
+    } catch (error) {
+      logError('手办化模块: 图片大小检测失败', {
+        url: imageUrl.substring(0, 100) + '...',
+        error: error?.message
+      })
+      // 检测失败时允许继续处理
+      return { size: 0, isValid: true }
+    }
+  }
+
   // 处理图片URL
   async function processImageUrl(imageUrl: string): Promise<string> {
     try {
-      // 如果是网络URL，直接返回
+      // 如果是网络URL，检测图片大小
       if (imageUrl.startsWith('http://') || imageUrl.startsWith('https://')) {
-        logInfo('手办化模块: 使用网络URL', { url: imageUrl.substring(0, 100) + '...' })
-        return imageUrl
-      }
-      
-      // 如果是base64，直接返回
-      if (imageUrl.startsWith('data:image/')) {
-        logInfo('手办化模块: 使用base64图片')
-        return imageUrl
-      }
-      
-      // 如果是本地文件路径，尝试上传到临时服务器
-      if (imageUrl.startsWith('file://')) {
-        logInfo('手办化模块: 检测到本地文件路径，尝试上传', { originalUrl: imageUrl })
+        const { size, isValid } = await checkImageSize(imageUrl)
         
-        // 将file://路径转换为实际文件路径
-        const filePath = imageUrl.replace('file://', '')
+        if (!isValid) {
+          const suggestion = size > 20 ? '建议压缩图片至5MB以下' : 
+                           size > 10 ? '建议压缩图片至3MB以下' : 
+                           '建议压缩图片至2MB以下'
+          throw new Error(`图片过大: ${size.toFixed(2)}MB，最大支持${config.maxImageSize}MB。${suggestion}`)
+        }
         
-        // 读取文件并转换为base64
-        const fs = await import('fs/promises')
-        const fileBuffer = await fs.readFile(filePath)
-        const base64 = fileBuffer.toString('base64')
-        
-        // 根据文件扩展名确定MIME类型
-        const ext = filePath.split('.').pop()?.toLowerCase()
-        let mimeType = 'image/jpeg'
-        if (ext === 'png') mimeType = 'image/png'
-        else if (ext === 'gif') mimeType = 'image/gif'
-        else if (ext === 'webp') mimeType = 'image/webp'
-        
-        const dataUrl = `data:${mimeType};base64,${base64}`
-        logInfo('手办化模块: 本地文件转换为base64成功', { 
-          filePath: filePath.substring(0, 50) + '...',
-          size: fileBuffer.length,
-          mimeType
+        logInfo('手办化模块: 使用网络URL', { 
+          url: imageUrl.substring(0, 100) + '...',
+          sizeInMB: size.toFixed(2)
         })
-        
-        return dataUrl
+        return imageUrl
+      }
+      
+      // 如果是base64，需要上传到临时服务（API不支持base64）
+      if (imageUrl.startsWith('data:image/')) {
+        logError('手办化模块: API不支持base64格式，请使用图片直链', { 
+          imageType: imageUrl.substring(5, imageUrl.indexOf(';')),
+          dataLength: imageUrl.length 
+        })
+        throw new Error('API不支持base64格式，请使用图片直链')
+      }
+      
+      // 如果是本地文件路径，不支持（API需要图片直链）
+      if (imageUrl.startsWith('file://')) {
+        logError('手办化模块: API不支持本地文件，请使用图片直链', { 
+          filePath: imageUrl.substring(7, 50) + '...'
+        })
+        throw new Error('API不支持本地文件，请使用图片直链')
       }
       
       logError('手办化模块: 不支持的图片格式', { imageUrl: imageUrl.substring(0, 100) })
@@ -198,13 +229,27 @@ export function apply(ctx: Context, config: Config) {
         return
       }
 
+      // 根据图片大小动态调整超时时间
+      const { size } = await checkImageSize(processedUrl)
+      let dynamicTimeout = config.apiTimeout
+      
+      // 根据图片大小调整超时时间
+      if (size > 5) {
+        dynamicTimeout = Math.min(config.apiTimeout * 1.5, 300) // 大图片增加50%超时时间，最大300秒
+      } else if (size > 2) {
+        dynamicTimeout = Math.min(config.apiTimeout * 1.2, 240) // 中等图片增加20%超时时间，最大240秒
+      }
+      
       // 调用API
       logInfo('手办化模块: 发送API请求', {
         style: style,
         url: processedUrl.substring(0, 100) + '...',
         keyLength: config.apiKey?.length || 0,
         keyValue: config.apiKey ? config.apiKey.substring(0, 4) + '...' : 'undefined',
-        urlType: processedUrl.startsWith('data:') ? 'base64' : 'http'
+        urlType: processedUrl.startsWith('data:') ? 'base64' : 'http',
+        imageSize: size.toFixed(2) + 'MB',
+        timeout: dynamicTimeout,
+        originalTimeout: config.apiTimeout
       })
       
       // 根据API文档，只支持GET请求，所有参数都是query参数
@@ -214,7 +259,7 @@ export function apply(ctx: Context, config: Config) {
           url: processedUrl,
           key: config.apiKey
         },
-        timeout: 30000
+        timeout: dynamicTimeout * 1000 // 使用动态调整的超时时间
       }) as FigurineResponse
       
       logInfo('手办化模块: API响应', { 
@@ -226,9 +271,26 @@ export function apply(ctx: Context, config: Config) {
       })
       
       if (response.code !== 200) {
+        // 根据错误码提供更具体的错误信息
+        let errorMessage = response.msg || '未知错误'
+        switch (response.code) {
+          case -2:
+            errorMessage = '无结果，可能是图片格式不支持或图片无法访问'
+            break
+          case -8:
+            errorMessage = 'API密钥错误，请检查配置'
+            break
+          case -1:
+            errorMessage = '参数错误，请检查图片链接'
+            break
+          default:
+            errorMessage = response.msg || `错误码: ${response.code}`
+        }
+        
         logError('手办化模块: API返回错误', { 
           code: response.code, 
           msg: response.msg,
+          errorMessage: errorMessage,
           requestId: response.request_id,
           fullResponse: response,
           requestType: 'GET',
@@ -238,7 +300,7 @@ export function apply(ctx: Context, config: Config) {
             keyLength: config.apiKey?.length || 0
           }
         })
-        await session.send(`手办化失败: ${response.msg || '未知错误'}`)
+        await session.send(`手办化失败: ${errorMessage}`)
         // 处理失败时立即清除处理状态
         processingUsers.delete(userId)
         return
@@ -271,6 +333,19 @@ export function apply(ctx: Context, config: Config) {
       }, config.cooldownTime * 1000)
       
     } catch (error) {
+      let errorMessage = '手办化处理失败，请稍后重试'
+      
+      // 根据错误类型提供更具体的提示
+      if (error?.message?.includes('request timeout') || error?.code === 'ETIMEDOUT') {
+        errorMessage = '处理超时，图片可能过大或网络较慢，请尝试使用较小的图片'
+      } else if (error?.message?.includes('图片过大')) {
+        errorMessage = error.message
+      } else if (error?.message?.includes('API不支持')) {
+        errorMessage = error.message
+      } else if (error?.message?.includes('不支持的图片格式')) {
+        errorMessage = error.message
+      }
+      
       logError('手办化模块: 处理图片失败', {
         error: error,
         errorMessage: error?.message || '未知错误',
@@ -280,7 +355,8 @@ export function apply(ctx: Context, config: Config) {
         imageUrl: imageUrl.substring(0, 100) + '...',
         processedUrl: processedUrl?.substring(0, 100) + '...' || '未处理'
       })
-      await session.send('手办化处理失败，请检查图片链接是否有效或稍后重试')
+      
+      await session.send(errorMessage)
       // 处理失败时立即清除处理状态
       processingUsers.delete(userId)
     }
