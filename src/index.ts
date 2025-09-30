@@ -26,6 +26,12 @@ export function apply(ctx: Context, config: Config) {
   const waitingImages: Map<string, { style: number, timeout: NodeJS.Timeout }> = new Map()
   const processingUsers: Set<string> = new Set()
 
+  // 验证API密钥配置
+  if (!config.apiKey || config.apiKey.trim() === '') {
+    logger.error('手办化模块: API密钥未配置或为空')
+    return
+  }
+
   // 日志函数
   function logInfo(message: string, data?: any) {
     if (config.enableLog && logger) {
@@ -90,122 +96,13 @@ export function apply(ctx: Context, config: Config) {
     return images
   }
 
-  // 上传图片到临时服务器
-  async function uploadImageToTempServer(imageUrl: string): Promise<string> {
+  // 处理图片URL
+  async function processImageUrl(imageUrl: string): Promise<string> {
     try {
-      // 如果是网络URL，检查是否为腾讯多媒体链接
+      // 如果是网络URL，直接返回
       if (imageUrl.startsWith('http://') || imageUrl.startsWith('https://')) {
-        // 检查是否为腾讯多媒体下载链接
-        if (imageUrl.includes('multimedia.nt.qq.com.cn')) {
-          logInfo('手办化模块: 检测到腾讯多媒体链接，尝试下载并转换为base64', { url: imageUrl.substring(0, 100) + '...' })
-          
-          try {
-            // 下载图片并转换为base64
-            const response = await ctx.http.get(imageUrl, { 
-              responseType: 'arraybuffer',
-              timeout: 15000,
-              headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Referer': 'https://im.qq.com/',
-                'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8'
-              }
-            }) as ArrayBuffer
-            
-            const buffer = Buffer.from(response)
-            const base64 = buffer.toString('base64')
-            
-            // 根据文件扩展名确定MIME类型
-            let contentType = 'image/jpeg'
-            if (imageUrl.includes('.png')) {
-              contentType = 'image/png'
-            } else if (imageUrl.includes('.gif')) {
-              contentType = 'image/gif'
-            } else if (imageUrl.includes('.webp')) {
-              contentType = 'image/webp'
-            }
-            
-            const dataUrl = `data:${contentType};base64,${base64}`
-            
-            logInfo('手办化模块: 腾讯多媒体链接转换成功', {
-              originalUrl: imageUrl.substring(0, 100) + '...',
-              size: buffer.length,
-              contentType,
-              dataUrlLength: dataUrl.length
-            })
-            
-            return dataUrl
-          } catch (downloadError) {
-            logError('手办化模块: 腾讯多媒体链接下载失败，尝试直接使用原链接', {
-              url: imageUrl.substring(0, 100) + '...',
-              error: downloadError?.message
-            })
-            // 下载失败时，仍然尝试使用原链接
-            return imageUrl
-          }
-        } else {
-          // 检查是否为其他可能需要特殊处理的链接
-          const problematicDomains = [
-            'multimedia.nt.qq.com.cn',
-            'c2cpicdw.qpic.cn',
-            'gchat.qpic.cn',
-            'wx.qlogo.cn'
-          ]
-          
-          const isProblematic = problematicDomains.some(domain => imageUrl.includes(domain))
-          
-          if (isProblematic) {
-            logInfo('手办化模块: 检测到可能的问题链接，尝试下载并转换为base64', { 
-              url: imageUrl.substring(0, 100) + '...',
-              domain: problematicDomains.find(domain => imageUrl.includes(domain))
-            })
-            
-            try {
-              // 下载图片并转换为base64
-              const response = await ctx.http.get(imageUrl, { 
-                responseType: 'arraybuffer',
-                timeout: 15000,
-                headers: {
-                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                  'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8'
-                }
-              }) as ArrayBuffer
-              
-              const buffer = Buffer.from(response)
-              const base64 = buffer.toString('base64')
-              
-              // 根据文件扩展名确定MIME类型
-              let contentType = 'image/jpeg'
-              if (imageUrl.includes('.png')) {
-                contentType = 'image/png'
-              } else if (imageUrl.includes('.gif')) {
-                contentType = 'image/gif'
-              } else if (imageUrl.includes('.webp')) {
-                contentType = 'image/webp'
-              }
-              
-              const dataUrl = `data:${contentType};base64,${base64}`
-              
-              logInfo('手办化模块: 问题链接转换成功', {
-                originalUrl: imageUrl.substring(0, 100) + '...',
-                size: buffer.length,
-                contentType,
-                dataUrlLength: dataUrl.length
-              })
-              
-              return dataUrl
-            } catch (downloadError) {
-              logError('手办化模块: 问题链接下载失败，尝试直接使用原链接', {
-                url: imageUrl.substring(0, 100) + '...',
-                error: downloadError?.message
-              })
-              // 下载失败时，仍然尝试使用原链接
-              return imageUrl
-            }
-          } else {
-            logInfo('手办化模块: 使用普通网络URL', { url: imageUrl.substring(0, 100) + '...' })
-            return imageUrl
-          }
-        }
+        logInfo('手办化模块: 使用网络URL', { url: imageUrl.substring(0, 100) + '...' })
+        return imageUrl
       }
       
       // 如果是base64，直接返回
@@ -247,7 +144,7 @@ export function apply(ctx: Context, config: Config) {
       throw new Error('不支持的图片格式')
       
     } catch (error) {
-      logError('手办化模块: 图片上传处理失败', error)
+      logError('手办化模块: 图片处理失败', error)
       throw error
     }
   }
@@ -287,47 +184,38 @@ export function apply(ctx: Context, config: Config) {
       await session.send('正在生成手办化图片，请稍候...')
       
       // 处理图片URL
-      processedUrl = await uploadImageToTempServer(imageUrl)
+      processedUrl = await processImageUrl(imageUrl)
       logInfo('手办化模块: 图片URL处理完成', { 
         original: imageUrl.substring(0, 50) + '...',
         processed: processedUrl.substring(0, 50) + '...'
       })
       
+      // 验证API密钥
+      if (!config.apiKey || config.apiKey.trim() === '') {
+        logError('手办化模块: API密钥为空，无法调用API')
+        await session.send('手办化失败: API密钥未配置')
+        processingUsers.delete(userId)
+        return
+      }
+
       // 调用API
       logInfo('手办化模块: 发送API请求', {
         style: style,
         url: processedUrl.substring(0, 100) + '...',
         keyLength: config.apiKey?.length || 0,
+        keyValue: config.apiKey ? config.apiKey.substring(0, 4) + '...' : 'undefined',
         urlType: processedUrl.startsWith('data:') ? 'base64' : 'http'
       })
       
-      let response: FigurineResponse
-      
-      // 如果是base64数据，使用POST请求避免URL过长
-      if (processedUrl.startsWith('data:image/')) {
-        const base64Data = processedUrl.split(',')[1] // 移除data:image/jpeg;base64,前缀
-        
-        response = await ctx.http.post('https://v2.xxapi.cn/api/generateFigurineImage', {
+      // 根据API文档，只支持GET请求，所有参数都是query参数
+      const response = await ctx.http.get('https://v2.xxapi.cn/api/generateFigurineImage', {
+        params: {
           style: style,
-          image: base64Data,
+          url: processedUrl,
           key: config.apiKey
-        }, {
-          timeout: 30000,
-          headers: {
-            'Content-Type': 'application/json'
-          }
-        }) as FigurineResponse
-      } else {
-        // 普通URL使用GET请求
-        response = await ctx.http.get('https://v2.xxapi.cn/api/generateFigurineImage', {
-          params: {
-            style: style,
-            url: processedUrl,
-            key: config.apiKey
-          },
-          timeout: 30000
-        }) as FigurineResponse
-      }
+        },
+        timeout: 30000
+      }) as FigurineResponse
       
       logInfo('手办化模块: API响应', { 
         code: response.code, 
@@ -343,7 +231,7 @@ export function apply(ctx: Context, config: Config) {
           msg: response.msg,
           requestId: response.request_id,
           fullResponse: response,
-          requestType: processedUrl.startsWith('data:') ? 'POST' : 'GET',
+          requestType: 'GET',
           requestParams: {
             style: style,
             url: processedUrl.substring(0, 100) + '...',
