@@ -1,4 +1,5 @@
 import { Context, Schema, h } from 'koishi'
+import * as path from 'path'
 
 export const name = 'aka-xxapi-figurine'
 
@@ -11,7 +12,7 @@ export interface Config {
 }
 
 export const Config: Schema<Config> = Schema.object({
-  apiKey: Schema.string().required().description('API密钥'),
+  apiKey: Schema.string().required().description('手办化API密钥'),
   cooldownTime: Schema.number().default(30).min(5).max(300).description('等待发送图片的时间(秒)'),
   apiTimeout: Schema.number().default(120).min(30).max(300).description('API请求超时时间(秒)'),
   maxImageSize: Schema.number().default(10).min(1).max(50).description('最大图片大小限制(MB)'),
@@ -36,6 +37,7 @@ export function apply(ctx: Context, config: Config) {
     return
   }
 
+
   // 日志函数
   function logInfo(message: string, data?: any) {
     if (config.enableLog && logger) {
@@ -49,61 +51,60 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  // 提取图片
+  // 提取图片 - 严格按照动漫人物识别插件的实现
   function extractImages(session: any): string[] {
     const images: string[] = []
     
-    // 首先尝试从session.elements中提取图片
-    if (session.elements) {
-      for (const element of session.elements) {
-        if (element.type === 'image' || element.type === 'img') {
-          // 处理图片元素
-          const url = element.attrs?.url || element.attrs?.src
-          if (url) {
-            images.push(url)
-            logInfo('手办化模块: 从elements中提取到图片', { 
-              type: element.type,
-              url: url.substring(0, 100) + '...',
-              attrs: element.attrs
-            })
-          }
-        }
-      }
+    // 严格按照参考项目：优先从session.quote?.elements获取图片
+    let elements = session.quote?.elements
+    if (!elements) {
+      // 如果没有quote，则从session.elements获取
+      elements = session.elements
     }
     
-    // 如果elements中没有找到图片，尝试从content中提取
-    if (images.length === 0 && session.content) {
-      // 匹配图片URL模式
-      const urlPattern = /https?:\/\/[^\s]+\.(jpg|jpeg|png|gif|webp)/gi
-      const urlMatches = session.content.match(urlPattern)
-      if (urlMatches) {
-        images.push(...urlMatches)
-        logInfo('手办化模块: 从content中提取到图片URL', { count: urlMatches.length })
-      }
+    if (elements) {
+      const imgElements = h.select(elements, 'img')
       
-      // 匹配base64图片
-      const base64Pattern = /data:image\/[^;]+;base64,[A-Za-z0-9+/=]+/gi
-      const base64Matches = session.content.match(base64Pattern)
-      if (base64Matches) {
-        images.push(...base64Matches)
-        logInfo('手办化模块: 从content中提取到base64图片', { count: base64Matches.length })
+      for (const img of imgElements) {
+        // 严格按照参考项目：使用img.attrs.src获取图片直链
+        const imageUrl = img.attrs?.src
+        if (imageUrl) {
+          images.push(imageUrl)
+          logInfo('手办化模块: 从img.attrs.src提取到图片直链', { 
+            extractedUrl: imageUrl,
+            urlLength: imageUrl.length,
+            fileName: img.attrs?.file || 'unknown',
+            fileSize: img.attrs?.fileSize || 'unknown',
+            subType: img.attrs?.subType || 'unknown',
+            source: session.quote?.elements ? 'quote' : 'session'
+          })
+        }
       }
     }
     
     logInfo('手办化模块: 图片提取结果', { 
       totalImages: images.length,
+      hasQuote: !!session.quote?.elements,
       hasElements: !!session.elements,
-      elementsCount: session.elements?.length || 0,
-      contentLength: session.content?.length || 0
+      elementsCount: elements?.length || 0,
+      extractedImages: images.map((url, index) => ({
+        index: index + 1,
+        url: url,
+        urlLength: url.length,
+        isQQImage: url.includes('gchat.qpic.cn') || url.includes('multimedia.nt.qq.com.cn'),
+        isHttp: url.startsWith('http://'),
+        isHttps: url.startsWith('https://'),
+        domain: url.startsWith('http') ? new URL(url).hostname : 'local'
+      }))
     })
     
     return images
   }
 
-  // 检测图片大小
-  async function checkImageSize(imageUrl: string): Promise<{ size: number, isValid: boolean }> {
+  // 检测图片大小和格式
+  async function checkImageSize(imageUrl: string): Promise<{ size: number, isValid: boolean, contentType?: string }> {
     try {
-      // 发送HEAD请求获取图片大小
+      // 发送HEAD请求获取图片信息
       const response = await ctx.http.head(imageUrl, {
         timeout: 10000,
         headers: {
@@ -112,19 +113,30 @@ export function apply(ctx: Context, config: Config) {
       })
       
       const contentLength = parseInt((response as any).headers?.['content-length'] || '0')
+      const contentType = (response as any).headers?.['content-type'] || ''
       const sizeInMB = contentLength / (1024 * 1024)
-      const isValid = sizeInMB <= config.maxImageSize
       
-      logInfo('手办化模块: 图片大小检测', {
+      // 检查图片格式
+      const isValidFormat = contentType.startsWith('image/jpeg') || 
+                           contentType.startsWith('image/jpg') || 
+                           contentType.startsWith('image/png')
+      
+      const isValidSize = sizeInMB <= config.maxImageSize && sizeInMB > 0.01 // 至少10KB
+      const isValid = isValidFormat && isValidSize
+      
+      logInfo('手办化模块: 图片检测', {
         url: imageUrl.substring(0, 100) + '...',
         sizeInMB: sizeInMB.toFixed(2),
+        contentType: contentType,
         maxSize: config.maxImageSize,
+        isValidFormat: isValidFormat,
+        isValidSize: isValidSize,
         isValid: isValid
       })
       
-      return { size: sizeInMB, isValid }
+      return { size: sizeInMB, isValid, contentType }
     } catch (error) {
-      logError('手办化模块: 图片大小检测失败', {
+      logError('手办化模块: 图片检测失败', {
         url: imageUrl.substring(0, 100) + '...',
         error: error?.message
       })
@@ -133,46 +145,30 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  // 处理图片URL
+  // 处理图片URL - 参考动漫识别插件的简化处理逻辑
   async function processImageUrl(imageUrl: string): Promise<string> {
     try {
-      // 如果是网络URL，检测图片大小
+      // 直接使用图片URL，QQ图片的src已经是公网可访问的直链
       if (imageUrl.startsWith('http://') || imageUrl.startsWith('https://')) {
-        const { size, isValid } = await checkImageSize(imageUrl)
-        
-        if (!isValid) {
-          const suggestion = size > 20 ? '建议压缩图片至5MB以下' : 
-                           size > 10 ? '建议压缩图片至3MB以下' : 
-                           '建议压缩图片至2MB以下'
-          throw new Error(`图片过大: ${size.toFixed(2)}MB，最大支持${config.maxImageSize}MB。${suggestion}`)
-        }
-        
-        logInfo('手办化模块: 使用网络URL', { 
+        logInfo('手办化模块: 使用图片直链', { 
           url: imageUrl.substring(0, 100) + '...',
-          sizeInMB: size.toFixed(2)
+          isQQImage: imageUrl.includes('gchat.qpic.cn') || imageUrl.includes('multimedia.nt.qq.com.cn'),
+          domain: new URL(imageUrl).hostname
         })
         return imageUrl
       }
       
-      // 如果是base64，需要上传到临时服务（API不支持base64）
+      // 不支持base64格式
       if (imageUrl.startsWith('data:image/')) {
-        logError('手办化模块: API不支持base64格式，请使用图片直链', { 
+        logError('手办化模块: API不支持base64格式', { 
           imageType: imageUrl.substring(5, imageUrl.indexOf(';')),
           dataLength: imageUrl.length 
         })
-        throw new Error('API不支持base64格式，请使用图片直链')
-      }
-      
-      // 如果是本地文件路径，不支持（API需要图片直链）
-      if (imageUrl.startsWith('file://')) {
-        logError('手办化模块: API不支持本地文件，请使用图片直链', { 
-          filePath: imageUrl.substring(7, 50) + '...'
-        })
-        throw new Error('API不支持本地文件，请使用图片直链')
+        throw new Error('API不支持base64格式，请发送图片而不是粘贴图片')
       }
       
       logError('手办化模块: 不支持的图片格式', { imageUrl: imageUrl.substring(0, 100) })
-      throw new Error('不支持的图片格式')
+      throw new Error('不支持的图片格式，请发送图片而不是链接')
       
     } catch (error) {
       logError('手办化模块: 图片处理失败', error)
@@ -180,7 +176,7 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  // 等待图片
+  // 等待图片 - 参考动漫人物识别插件的实现
   async function waitForImage(session: any, style: number): Promise<string> {
     const userId = session.userId
     
@@ -200,7 +196,7 @@ export function apply(ctx: Context, config: Config) {
     
     waitingImages.set(userId, { style, timeout })
     
-    return `[${userId}] 请发送一张图片，我将使用风格${style}进行手办化处理（${config.cooldownTime}秒内有效）`
+    return `请发送一张图片，我将使用风格${style}进行手办化处理（${config.cooldownTime}秒内有效）`
   }
 
   // 处理图片
@@ -229,16 +225,8 @@ export function apply(ctx: Context, config: Config) {
         return
       }
 
-      // 根据图片大小动态调整超时时间
-      const { size } = await checkImageSize(processedUrl)
-      let dynamicTimeout = config.apiTimeout
-      
-      // 根据图片大小调整超时时间
-      if (size > 5) {
-        dynamicTimeout = Math.min(config.apiTimeout * 1.5, 300) // 大图片增加50%超时时间，最大300秒
-      } else if (size > 2) {
-        dynamicTimeout = Math.min(config.apiTimeout * 1.2, 240) // 中等图片增加20%超时时间，最大240秒
-      }
+      // 使用默认超时时间
+      const dynamicTimeout = config.apiTimeout
       
       // 调用API
       logInfo('手办化模块: 发送API请求', {
@@ -246,8 +234,7 @@ export function apply(ctx: Context, config: Config) {
         url: processedUrl.substring(0, 100) + '...',
         keyLength: config.apiKey?.length || 0,
         keyValue: config.apiKey ? config.apiKey.substring(0, 4) + '...' : 'undefined',
-        urlType: processedUrl.startsWith('data:') ? 'base64' : 'http',
-        imageSize: size.toFixed(2) + 'MB',
+        urlType: 'network_url',
         timeout: dynamicTimeout,
         originalTimeout: config.apiTimeout
       })
@@ -275,7 +262,10 @@ export function apply(ctx: Context, config: Config) {
         let errorMessage = response.msg || '未知错误'
         switch (response.code) {
           case -2:
-            errorMessage = '无结果，可能是图片格式不支持或图片无法访问'
+            errorMessage = '图片处理失败，请确保图片URL直接指向图片文件，避免使用动态生成的图片服务'
+            break
+          case -4:
+            errorMessage = '图片不合法，请使用JPG或PNG格式的图片，大小建议1-5MB'
             break
           case -8:
             errorMessage = 'API密钥错误，请检查配置'
@@ -362,40 +352,40 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  // 设置手办化指令
-  for (let style = 1; style <= 4; style++) {
-    ctx.command(`手办化${style}`, `使用风格${style}进行手办化`)
-      .action(async (argv) => {
-        const userId = argv.session.userId
+  // 设置手办化指令 - 参考动漫人物识别插件的实现
+  ctx.command('手办化', '通过图片生成手办化效果')
+    .option('style', '-s <style:number>', { fallback: 1 })
+    .action(async (argv) => {
+      const userId = argv.session.userId
+      const style = Number(argv.options.style) || 1
+      
+      // 检查用户是否正在处理中
+      if (processingUsers.has(userId)) {
+        return '手办化正在处理中，请等待当前任务完成后再试'
+      }
+      
+      // 立即标记用户为处理中状态，防止重复调用
+      processingUsers.add(userId)
+      
+      try {
+        logInfo(`手办化模块: 用户请求手办化风格${style}`, { userId })
         
-        // 检查用户是否正在处理中
-        if (processingUsers.has(userId)) {
-          return '手办化正在处理中，请等待当前任务完成后再试'
+        // 检查消息中是否有图片
+        const images = extractImages(argv.session)
+        if (images.length > 0) {
+          // 直接处理第一张图片
+          return await processImage(argv.session, images[0], style)
+        } else {
+          // 没有图片，等待用户发送图片
+          return await waitForImage(argv.session, style)
         }
-        
-        // 立即标记用户为处理中状态，防止重复调用
-        processingUsers.add(userId)
-        
-        try {
-          logInfo(`手办化模块: 用户请求手办化风格${style}`, { userId })
-          
-          // 检查消息中是否有图片
-          const images = extractImages(argv.session)
-          if (images.length > 0) {
-            // 直接处理第一张图片
-            return await processImage(argv.session, images[0], style)
-          } else {
-            // 没有图片，等待用户发送图片
-            return await waitForImage(argv.session, style)
-          }
-        } catch (error) {
-          logError('手办化模块错误', error)
-          // 处理失败时也要清除处理状态
-          processingUsers.delete(userId)
-          return '手办化处理失败，请稍后重试'
-        }
-      })
-  }
+      } catch (error) {
+        logError('手办化模块错误', error)
+        // 处理失败时也要清除处理状态
+        processingUsers.delete(userId)
+        return '手办化处理失败，请稍后重试'
+      }
+    })
 
   // 添加重置处理状态的指令
   ctx.command('手办化重置', '重置手办化处理状态')
@@ -418,7 +408,7 @@ export function apply(ctx: Context, config: Config) {
       return wasProcessing ? '已重置处理状态，可以重新使用手办化指令' : '当前没有处理中的任务'
     })
 
-  // 监听消息事件，处理等待中的图片
+  // 监听消息事件，处理等待中的图片 - 参考动漫人物识别插件的实现
   ctx.on('message', async (session) => {
     if (session.userId && waitingImages.has(session.userId)) {
       const images = extractImages(session)
