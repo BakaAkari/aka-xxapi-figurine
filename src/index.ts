@@ -51,11 +51,69 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  // 提取图片 - 严格按照动漫人物识别插件的实现
+  // 获取图片URL - 参考yunwu插件的实现
+  async function getImageUrl(img: any, session: any): Promise<string | null> {
+    let url: string | null = null
+    
+    // 方法1：从命令参数获取图片
+    if (img) {
+      url = img.attrs?.src || null
+      if (url) {
+        logInfo('手办化模块: 从命令参数获取图片', { url })
+        return url
+      }
+    }
+    
+    // 方法2：从引用消息获取图片
+    let elements = session.quote?.elements
+    if (elements) {
+      const images = h.select(elements, 'img')
+      if (images.length > 0) {
+        url = images[0].attrs.src
+        logInfo('手办化模块: 从引用消息获取图片', { url })
+        return url
+      }
+    }
+    
+    // 方法3：从session.elements获取图片（备用方案）
+    elements = session.elements
+    if (elements) {
+      const images = h.select(elements, 'img')
+      if (images.length > 0) {
+        url = images[0].attrs.src
+        logInfo('手办化模块: 从session元素获取图片', { url })
+        return url
+      }
+    }
+    
+    // 方法4：等待用户发送图片
+    await session.send('请在30秒内发送一张图片')
+    const msg = await session.prompt(30000)
+    
+    if (!msg) {
+      await session.send('等待超时')
+      return null
+    }
+    
+    // 解析用户发送的消息
+    elements = h.parse(msg)
+    const images = h.select(elements, 'img')
+    
+    if (images.length === 0) {
+      await session.send('未检测到图片，请重试')
+      return null
+    }
+    
+    url = images[0].attrs.src
+    logInfo('手办化模块: 从用户输入获取图片', { url })
+    return url
+  }
+
+  // 提取图片 - 兼容旧版本调用
   function extractImages(session: any): string[] {
     const images: string[] = []
     
-    // 严格按照参考项目：优先从session.quote?.elements获取图片
+    // 优先从session.quote?.elements获取图片
     let elements = session.quote?.elements
     if (!elements) {
       // 如果没有quote，则从session.elements获取
@@ -66,7 +124,6 @@ export function apply(ctx: Context, config: Config) {
       const imgElements = h.select(elements, 'img')
       
       for (const img of imgElements) {
-        // 严格按照参考项目：使用img.attrs.src获取图片直链
         const imageUrl = img.attrs?.src
         if (imageUrl) {
           images.push(imageUrl)
@@ -176,7 +233,7 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  // 等待图片 - 参考动漫人物识别插件的实现
+  // 等待图片 - 保留兼容性，但不再使用
   async function waitForImage(session: any, style: number): Promise<string> {
     const userId = session.userId
     
@@ -352,12 +409,12 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  // 设置手办化指令 - 参考动漫人物识别插件的实现
-  ctx.command('手办化', '通过图片生成手办化效果')
+  // 设置手办化指令 - 参考yunwu插件的实现
+  ctx.command('手办化 [img:text]', '通过图片生成手办化效果')
     .option('style', '-s <style:number>', { fallback: 1 })
-    .action(async (argv) => {
-      const userId = argv.session.userId
-      const style = Number(argv.options.style) || 1
+    .action(async ({ session, options }, img) => {
+      const userId = session.userId
+      const style = Number(options?.style) || 1
       
       // 检查用户是否正在处理中
       if (processingUsers.has(userId)) {
@@ -370,15 +427,15 @@ export function apply(ctx: Context, config: Config) {
       try {
         logInfo(`手办化模块: 用户请求手办化风格${style}`, { userId })
         
-        // 检查消息中是否有图片
-        const images = extractImages(argv.session)
-        if (images.length > 0) {
-          // 直接处理第一张图片
-          return await processImage(argv.session, images[0], style)
-        } else {
-          // 没有图片，等待用户发送图片
-          return await waitForImage(argv.session, style)
+        // 使用新的getImageUrl函数获取图片
+        const imageUrl = await getImageUrl(img, session)
+        if (!imageUrl) {
+          processingUsers.delete(userId)
+          return  // 错误信息已在 getImageUrl 中发送
         }
+        
+        // 直接处理图片
+        return await processImage(session, imageUrl, style)
       } catch (error) {
         logError('手办化模块错误', error)
         // 处理失败时也要清除处理状态
@@ -408,7 +465,7 @@ export function apply(ctx: Context, config: Config) {
       return wasProcessing ? '已重置处理状态，可以重新使用手办化指令' : '当前没有处理中的任务'
     })
 
-  // 监听消息事件，处理等待中的图片 - 参考动漫人物识别插件的实现
+  // 监听消息事件，处理等待中的图片 - 保留兼容性，但主要逻辑已移至getImageUrl
   ctx.on('message', async (session) => {
     if (session.userId && waitingImages.has(session.userId)) {
       const images = extractImages(session)
