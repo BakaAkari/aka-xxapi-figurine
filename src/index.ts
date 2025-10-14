@@ -197,7 +197,7 @@ export function apply(ctx: Context, config: Config) {
         url: imageUrl.substring(0, 100) + '...',
         error: error?.message
       })
-      // 检测失败时允许继续处理
+      // 检测失败时允许继续处理，但不暴露错误详情
       return { size: 0, isValid: true }
     }
   }
@@ -382,15 +382,15 @@ export function apply(ctx: Context, config: Config) {
     } catch (error) {
       let errorMessage = '手办化处理失败，请稍后重试'
       
-      // 根据错误类型提供更具体的提示
+      // 根据错误类型提供更具体的提示，但不暴露敏感信息
       if (error?.message?.includes('request timeout') || error?.code === 'ETIMEDOUT') {
         errorMessage = '处理超时，图片可能过大或网络较慢，请尝试使用较小的图片'
       } else if (error?.message?.includes('图片过大')) {
-        errorMessage = error.message
+        errorMessage = '图片过大，请使用较小的图片'
       } else if (error?.message?.includes('API不支持')) {
-        errorMessage = error.message
+        errorMessage = 'API不支持此类型的图片格式'
       } else if (error?.message?.includes('不支持的图片格式')) {
-        errorMessage = error.message
+        errorMessage = '不支持的图片格式，请发送图片而不是链接'
       }
       
       logError('手办化模块: 处理图片失败', {
